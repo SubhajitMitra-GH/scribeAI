@@ -231,16 +231,20 @@ function DetailsPage() {
     };
 
 return (
-        <div className="bg-gray-100 font-sans text-gray-900"
-        style={{
-      backgroundImage: `url(${myBackgroundImage})`,
-      backgroundAttachment: 'fixed',
-      backgroundSize: 'cover', // change to 'contain' if you want original image size
-      backgroundRepeat: 'no-repeat',
-      backgroundPosition: 'center',
-      minHeight: '100vh',
-    }}>
-            <div className="container mx-auto max-w-5xl p-4 md:p-8">
+      <div
+  className="relative font-sans text-gray-900"
+  style={{
+    backgroundImage: `url(${myBackgroundImage})`,
+    backgroundAttachment: 'fixed',
+    backgroundSize: 'cover',
+    backgroundRepeat: 'no-repeat',
+    backgroundPosition: 'center',
+    minHeight: '100vh',
+  }}
+>
+  <div className="absolute inset-0 bg-white/60 "></div>
+<div className="relative container mx-auto max-w-5xl p-4 md:p-8">
+
                 <Header />
                 <main className="rounded-2xl bg-white/50 p-6 shadow-xl md:p-8">
                     <StatusDisplay status={status} isProcessing={isProcessing} />
