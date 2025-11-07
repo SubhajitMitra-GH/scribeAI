@@ -1,5 +1,4 @@
 #!/bin/bash
 
-# Update and install ffmpeg
-apt-get update
-apt-get install -y ffmpeg
+# Amazon Linux (which Vercel uses) uses yum, not apt-get
+yum install -y ffmpeg
