@@ -1,5 +1,0 @@
-# Ignore files from the root that aren't needed
-package.json
-package-lock.json
-
-# The .gitignore file already handles node_modules, etc.
