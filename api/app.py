@@ -34,7 +34,7 @@ print("Loading Whisper model...")
 try:
     # Use the /tmp directory for downloading the model
     # This caches the model between "warm" invocations
-    whisper_model = whisper.load_model("base", download_root=CACHE_DIR)
+    whisper_model = whisper.load_model("tiny", download_root=CACHE_DIR)
     print("Whisper model loaded successfully.")
 except Exception as e:
     print(f"Error loading Whisper model: {e}")
