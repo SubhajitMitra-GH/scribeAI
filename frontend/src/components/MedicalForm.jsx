@@ -1,4 +1,4 @@
-import React, { useState, useImperativeHandle, forwardRef } from 'react';
+import React, { useState, useEffect, useImperativeHandle, forwardRef } from 'react';
 import { EventDetails, PatientDemographics, MedicalHistory, Habits, ClinicalExam, GingivaOralHealth, Plan } from './FormSections.jsx';
 
 // Define the initial empty state for the form
@@ -12,9 +12,25 @@ const getInitialState = () => ({
     calculus: '', stains: '', fluorosis: '', malocclusion: '', gingivitis: '', periodontitis: '', oral_mucosal_lesion: '', teeth_cleaning_method: '',
     doctors_name: '', treatment_plan: ''
 });
-
+const FIXED_FIELDS = ["organised_by", "department", "event_date", "event_place", "event_district"];
 const MedicalForm = forwardRef(({ onStatusChange }, ref) => {
     const [formData, setFormData] = useState(getInitialState());
+
+  // Load fixed fields from localStorage on mount
+    useEffect(() => {
+        const saved = JSON.parse(localStorage.getItem("fixedFields"));
+        if (saved) setFormData(prev => ({ ...prev, ...saved }));
+    }, []);
+
+    // Save fixed fields to localStorage whenever they change
+    useEffect(() => {
+        const fixedData = {};
+        FIXED_FIELDS.forEach(key => {
+            fixedData[key] = formData[key];
+        });
+        localStorage.setItem("fixedFields", JSON.stringify(fixedData));
+    }, [formData]);
+
 
     const handleChange = (e) => {
         const { name, value, type, id } = e.target;
@@ -30,16 +46,24 @@ const MedicalForm = forwardRef(({ onStatusChange }, ref) => {
     // Expose methods to the parent App.jsx
     useImperativeHandle(ref, () => ({
         // Used by the global recorder to fill all fields
-        fillForm: (apiData) => {
-            setFormData(prev => ({...prev, ...apiData}));
-        },
+        // fillForm: (apiData) => {
+        //     setFormData(prev => ({...prev, ...apiData}));
+        // },
+         fillForm: (apiData) => setFormData(prev => ({ ...prev, ...apiData })),
         // Used by the global reset button
         resetForm: () => {
+             const initial = getInitialState();
+            const saved = JSON.parse(localStorage.getItem("fixedFields")) || {};
+            setFormData({ ...initial, ...saved }); // reset others but keep fixed
+        },
+        startNewDay: () => {
+            localStorage.removeItem("fixedFields");
             setFormData(getInitialState());
         },
-        getFormData: () => {
-            return { ...formData }; // Return a copy of all current field values
-        }
+        // getFormData: () => {
+        //     return { ...formData }; // Return a copy of all current field values
+        // }
+           getFormData: () => ({ ...formData })
     }));
 
     return (
