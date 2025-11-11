@@ -1,48 +1,38 @@
 import os
 import google.generativeai as genai
-import whisper
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import uuid
 import json
 from dotenv import load_dotenv
+import mimetypes
+import time # Import the time module
 
 # --- Configuration ---
 load_dotenv()
 
+# 1. Configure Gemini
 try:
     genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
 except KeyError:
     print("FATAL: GOOGLE_API_KEY environment variable not set.")
-    # In a serverless environment, we still want the app to load
-    # The function will just fail if this key is missing.
     pass
 
-# --- Vercel-Specific Paths ---
-# We can only write to the /tmp directory in a Vercel Serverless Function
+# --- Filesystem Paths ---
+# We still need the /tmp directory to save the audio file temporarily
 TEMP_DIR = "/tmp"
-CACHE_DIR = "/tmp/whisper_models"
-
-# Ensure cache directory exists
-os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(TEMP_DIR, exist_ok=True)
 
 # --- Initializations ---
 app = Flask(__name__)
 CORS(app)
 
-print("Loading Whisper model...")
+# Initialize the Generative AI model
 try:
-    # Use the /tmp directory for downloading the model
-    # This caches the model between "warm" invocations
-    whisper_model = whisper.load_model("base", download_root=CACHE_DIR)
-    print("Whisper model loaded successfully.")
+    gemini_model = genai.GenerativeModel('gemini-2.5-flash-preview-09-2025')
 except Exception as e:
-    print(f"Error loading Whisper model: {e}")
-    # Don't exit, allow the app to be deployed, but log the error
-    whisper_model = None
-
-gemini_model = genai.GenerativeModel('gemini-2.5-flash')
-
+    print(f"Error initializing Gemini model: {e}")
+    gemini_model = None
 
 # --- VOICE-FILLABLE SCHEMA ---
 VOICE_FILLABLE_SCHEMA = {
@@ -74,34 +64,98 @@ VOICE_FILLABLE_SCHEMA = {
 }
 
 
+# --- Helper Function ---
+def get_extension_from_mimetype(mime_type):
+    """Gets a file extension from a MIME type."""
+    if not mime_type:
+        return '.dat' # default extension
+    
+    if mime_type == 'audio/webm':
+        return '.webm'
+    if mime_type == 'audio/mpeg':
+        return '.mp3'
+    if mime_type == 'audio/mp4': # m4a is often sent as audio/mp4
+        return '.m4a'
+    if mime_type == 'audio/wav' or mime_type == 'audio/x-wav':
+        return '.wav'
+    if mime_type == 'audio/ogg':
+        return '.ogg'
+    
+    # Use mimetypes library as a fallback
+    extension = mimetypes.guess_extension(mime_type)
+    return extension if extension else '.dat'
+
+def wait_for_file_active(file_response, timeout_sec=30):
+    """Waits for the Google File API to mark the file as ACTIVE."""
+    start_time = time.time()
+    print(f"Waiting for file {file_response.name} to become active...")
+    file = genai.get_file(file_response.name)
+    while file.state.name == 'PROCESSING':
+        if time.time() - start_time > timeout_sec:
+            raise Exception(f"File processing timed out after {timeout_sec} seconds.")
+        time.sleep(1) # Wait 1 second before checking again
+        file = genai.get_file(file_response.name)
+    
+    if file.state.name == 'ACTIVE':
+        print(f"File {file.name} is now ACTIVE.")
+        return file
+    else:
+        raise Exception(f"File {file.name} failed to process. State: {file.state.name}")
+
 # --- Flask Routes ---
 
 @app.route('/process_audio', methods=['POST'])
 def process_audio():
     print("\n--- Request received for detailed form processing ---")
-    if whisper_model is None:
-        return jsonify({'error': 'Whisper model failed to load. Check server logs.'}), 500
+    if gemini_model is None:
+        return jsonify({'error': 'Gemini model failed to load. Check server logs.'}), 500
 
     if 'audio_data' not in request.files:
         return jsonify({'error': 'No audio file found'}), 400
 
     audio_file = request.files['audio_data']
-    # Use the /tmp directory for saving the temporary file
-    temp_audio_path = os.path.join(TEMP_DIR, f"temp_audio_{uuid.uuid4()}.webm")
-    audio_file.save(temp_audio_path)
-    print(f"Audio saved to: {temp_audio_path}")
+    
+    # --- FIX: Use the browser's MIME type to determine extension ---
+    mime_type = audio_file.mimetype
+    extension = get_extension_from_mimetype(mime_type)
+    temp_audio_path = os.path.join(TEMP_DIR, f"temp_audio_{uuid.uuid4()}{extension}")
+    print(f"Detected MIME type: {mime_type}, saving to {temp_audio_path}")
+    # --- End Fix ---
 
+    audio_file_response = None # To hold the Google File API response
+    
     try:
-        # 1. Transcribe the entire conversation
-        print("Transcribing audio...")
-        result = whisper_model.transcribe(temp_audio_path, fp16=False)
-        transcribed_text = result['text']
+        audio_file.save(temp_audio_path)
+        print(f"Audio saved to: {temp_audio_path}")
+
+        # 1. Upload audio to Google File API for transcription
+        print(f"Uploading audio to Google File API: {temp_audio_path}")
+        # --- FIX: Use the original mime_type from the request ---
+        audio_file_response = genai.upload_file(
+            path=temp_audio_path,
+            display_name=os.path.basename(temp_audio_path),
+            mime_type=mime_type 
+        )
+        # --- End Fix ---
+        
+        # --- FIX: Wait for file to be ACTIVE ---
+        active_file_response = wait_for_file_active(audio_file_response)
+        # --- End Fix ---
+
+        # 2. Transcribe the entire conversation using Gemini
+        print("Transcribing audio via Gemini API...")
+        transcription_prompt = [
+            "Please transcribe the following audio file. Provide only the text transcription and nothing else.",
+            active_file_response # Use the active file
+        ]
+        transcription_response = gemini_model.generate_content(transcription_prompt)
+        transcribed_text = transcription_response.text
         print(f"Full Transcription: '{transcribed_text}'")
 
         if not transcribed_text.strip():
             return jsonify({'error': 'No speech detected.'})
 
-        # 2. Use a sophisticated prompt to extract all fields into a JSON object
+        # 3. Use a sophisticated prompt to extract all fields into a JSON object
         print("Extracting structured data with Gemini...")
         
         schema_description = "\n".join([f'- "{key}": "{description}"' for key, description in VOICE_FILLABLE_SCHEMA.items()])
@@ -149,29 +203,64 @@ def process_audio():
         print(f"An error occurred: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
+        # CRITICAL: Always clean up the temporary file
         if os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
             print(f"Cleaned up temp file: {temp_audio_path}")
+        # CRITICAL: Always clean up the uploaded file from Google
+        try:
+            if audio_file_response:
+                genai.delete_file(audio_file_response.name)
+                print(f"Cleaned up uploaded file: {audio_file_response.name}")
+        except Exception as e:
+            print(f"Error cleaning up uploaded file (it may auto-delete): {e}")
 
 @app.route('/transcribe', methods=['POST'])
 def transcribe_field():
     print("\n--- Request received for single field transcription ---")
-    if whisper_model is None:
-        return jsonify({'error': 'Whisper model failed to load. Check server logs.'}), 500
+    if gemini_model is None:
+        return jsonify({'error': 'Gemini model failed to load. Check server logs.'}), 500
 
     if 'audio_data' not in request.files:
         return jsonify({'error': 'No audio file found'}), 400
 
     audio_file = request.files['audio_data']
-    # Use the /tmp directory for saving the temporary file
-    temp_audio_path = os.path.join(TEMP_DIR, f"temp_audio_{uuid.uuid4()}.webm")
-    audio_file.save(temp_audio_path)
-    print(f"Audio saved to: {temp_audio_path}")
 
+    # --- FIX: Use the browser's MIME type to determine extension ---
+    mime_type = audio_file.mimetype
+    extension = get_extension_from_mimetype(mime_type)
+    temp_audio_path = os.path.join(TEMP_DIR, f"temp_audio_{uuid.uuid4()}{extension}")
+    print(f"Detected MIME type: {mime_type}, saving to {temp_audio_path}")
+    # --- End Fix ---
+    
+    audio_file_response = None # To hold the Google File API response
+    
     try:
-        print("Transcribing audio...")
-        result = whisper_model.transcribe(temp_audio_path, fp16=False)
-        transcribed_text = result['text']
+        audio_file.save(temp_audio_path)
+        print(f"Audio saved to: {temp_audio_path}")
+        
+        # 1. Upload audio to Google File API
+        print(f"Uploading audio to Google File API: {temp_audio_path}")
+        # --- FIX: Use the original mime_type from the request ---
+        audio_file_response = genai.upload_file(
+            path=temp_audio_path,
+            display_name=os.path.basename(temp_audio_path),
+            mime_type=mime_type
+        )
+        # --- End Fix ---
+        
+        # --- FIX: Wait for file to be ACTIVE ---
+        active_file_response = wait_for_file_active(audio_file_response)
+        # --- End Fix ---
+
+        # 2. Transcribe audio using Gemini
+        print("Transcribing audio via Gemini API...")
+        transcription_prompt = [
+            "Please transcribe the following audio file. Provide only the text transcription and nothing else.",
+            active_file_response # Use the active file
+        ]
+        transcription_response = gemini_model.generate_content(transcription_prompt)
+        transcribed_text = transcription_response.text
         print(f"Transcription result: '{transcribed_text}'")
 
         if not transcribed_text.strip():
@@ -183,11 +272,20 @@ def transcribe_field():
         print(f"An error occurred during transcription: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
+        # CRITICAL: Always clean up the temporary file
         if os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
             print(f"Cleaned up temp file: {temp_audio_path}")
+        # CRITICAL: Always clean up the uploaded file from Google
+        try:
+            if audio_file_response:
+                genai.delete_file(audio_file_response.name)
+                print(f"Cleaned up uploaded file: {audio_file_response.name}")
+        except Exception as e:
+            print(f"Error cleaning up uploaded file (it may auto-delete): {e}")
 
-# This check is not strictly needed for Vercel, but it's good practice
-# and allows you to still run `python api/app.py` locally for testing.
+# This block is for local development.
+# Render will use a WSGI server like Gunicorn and will not run this.
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)

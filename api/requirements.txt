@@ -1,6 +1,5 @@
 flask
-flask-cors
-python-dotenv
-openai-whisper
+flask_cors
 google-generativeai
+python-dotenv
 gunicorn

@@ -1,6 +1,0 @@
-flask
-flask-cors
-python-dotenv
-openai-whisper
-google-generativeai
-gunicorn
