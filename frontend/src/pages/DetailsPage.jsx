@@ -55,7 +55,7 @@ function DetailsPage() {
         const audioFormData = new FormData();
         audioFormData.append('audio_data', audioBlob, 'consultation.webm');
         try {
-            const response = await fetch('http://127.0.0.1:5000/process_audio', {
+            const response = await fetch('https://dentalbot-375s.onrender.com/process_audio', {
                 method: 'POST',
                 body: audioFormData
             });
