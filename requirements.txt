@@ -1,0 +1,8 @@
+Flask
+Flask-Cors
+python-dotenv
+google-generativeai
+openai-whisper
+torch==2.2.0+cpu
+torchaudio==2.2.0+cpu
+-f https://download.pytorch.org/whl/torch_stable.html
