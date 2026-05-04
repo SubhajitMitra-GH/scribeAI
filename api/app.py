@@ -1,38 +1,37 @@
 import os
-import google.generativeai as genai
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import time
 import uuid
 import json
-from dotenv import load_dotenv
 import mimetypes
-import time # Import the time module
+import traceback
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from dotenv import load_dotenv
 
-# --- Configuration ---
+# New GenAI Library Import
+from google import genai
+from google.genai import types
+
+# Audio Conversion Import
+from pydub import AudioSegment
+
 load_dotenv()
 
-# 1. Configure Gemini
-try:
-    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-except KeyError:
+# --- Configuration ---
+api_key = os.environ.get("GOOGLE_API_KEY")
+if not api_key:
     print("FATAL: GOOGLE_API_KEY environment variable not set.")
-    pass
+
+# Initialize the Gemini Client
+client = genai.Client(api_key=api_key)
+MODEL_ID = 'gemini-2.5-flash'
 
 # --- Filesystem Paths ---
-# We still need the /tmp directory to save the audio file temporarily
 TEMP_DIR = "/tmp"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# --- Initializations ---
 app = Flask(__name__)
 CORS(app)
-
-# Initialize the Generative AI model
-try:
-    gemini_model = genai.GenerativeModel('gemini-2.5-flash-preview-09-2025')
-except Exception as e:
-    print(f"Error initializing Gemini model: {e}")
-    gemini_model = None
 
 # --- VOICE-FILLABLE SCHEMA ---
 VOICE_FILLABLE_SCHEMA = {
@@ -63,230 +62,206 @@ VOICE_FILLABLE_SCHEMA = {
     'treatment_plan': "The proposed treatment plan based on the examination."
 }
 
+# --- Helper Functions ---
 
-# --- Helper Function ---
 def get_extension_from_mimetype(mime_type):
-    """Gets a file extension from a MIME type."""
-    if not mime_type:
-        return '.dat' # default extension
-    
-    if mime_type == 'audio/webm':
-        return '.webm'
-    if mime_type == 'audio/mpeg':
-        return '.mp3'
-    if mime_type == 'audio/mp4': # m4a is often sent as audio/mp4
-        return '.m4a'
-    if mime_type == 'audio/wav' or mime_type == 'audio/x-wav':
-        return '.wav'
-    if mime_type == 'audio/ogg':
-        return '.ogg'
-    
-    # Use mimetypes library as a fallback
-    extension = mimetypes.guess_extension(mime_type)
-    return extension if extension else '.dat'
+    if not mime_type: return '.dat'
+    mapping = {
+        'audio/webm': '.webm',
+        'audio/mpeg': '.mp3',
+        'audio/mp4': '.m4a',
+        'audio/wav': '.wav',
+        'audio/x-wav': '.wav',
+        'audio/ogg': '.ogg'
+    }
+    return mapping.get(mime_type, mimetypes.guess_extension(mime_type) or '.dat')
 
 def wait_for_file_active(file_response, timeout_sec=30):
-    """Waits for the Google File API to mark the file as ACTIVE."""
+    """Waits for the File to become active using the new Client.files.get method."""
     start_time = time.time()
     print(f"Waiting for file {file_response.name} to become active...")
-    file = genai.get_file(file_response.name)
-    while file.state.name == 'PROCESSING':
+    
+    file = client.files.get(name=file_response.name)
+    while file.state == "PROCESSING":
         if time.time() - start_time > timeout_sec:
             raise Exception(f"File processing timed out after {timeout_sec} seconds.")
-        time.sleep(1) # Wait 1 second before checking again
-        file = genai.get_file(file_response.name)
+        time.sleep(2)
+        file = client.files.get(name=file_response.name)
     
-    if file.state.name == 'ACTIVE':
+    if file.state == "ACTIVE":
         print(f"File {file.name} is now ACTIVE.")
         return file
     else:
-        raise Exception(f"File {file.name} failed to process. State: {file.state.name}")
+        raise Exception(f"File {file.name} failed to process. State: {file.state}")
 
 # --- Flask Routes ---
 
 @app.route('/process_audio', methods=['POST'])
 def process_audio():
     print("\n--- Request received for detailed form processing ---")
-    if gemini_model is None:
-        return jsonify({'error': 'Gemini model failed to load. Check server logs.'}), 500
-
     if 'audio_data' not in request.files:
         return jsonify({'error': 'No audio file found'}), 400
 
     audio_file = request.files['audio_data']
-    
-    # --- FIX: Use the browser's MIME type to determine extension ---
     mime_type = audio_file.mimetype
     extension = get_extension_from_mimetype(mime_type)
-    temp_audio_path = os.path.join(TEMP_DIR, f"temp_audio_{uuid.uuid4()}{extension}")
-    print(f"Detected MIME type: {mime_type}, saving to {temp_audio_path}")
-    # --- End Fix ---
-
-    audio_file_response = None # To hold the Google File API response
+    
+    # Define paths for both the raw upload and the converted WAV
+    base_uuid = str(uuid.uuid4())
+    temp_audio_path = os.path.join(TEMP_DIR, f"temp_raw_{base_uuid}{extension}")
+    clean_wav_path = os.path.join(TEMP_DIR, f"clean_audio_{base_uuid}.wav")
+    
+    uploaded_file = None
     
     try:
+        # 1. Save the raw file from the frontend
         audio_file.save(temp_audio_path)
-        print(f"Audio saved to: {temp_audio_path}")
 
-        # 1. Upload audio to Google File API for transcription
-        print(f"Uploading audio to Google File API: {temp_audio_path}")
-        # --- FIX: Use the original mime_type from the request ---
-        audio_file_response = genai.upload_file(
-            path=temp_audio_path,
-            display_name=os.path.basename(temp_audio_path),
-            mime_type=mime_type 
+        # 2. Convert to a clean WAV file using pydub
+        print(f"Converting {temp_audio_path} to clean WAV format...")
+        audio = AudioSegment.from_file(temp_audio_path)
+        audio.export(clean_wav_path, format="wav")
+
+        # 3. Upload the CLEAN WAV file to Google
+        print(f"Uploading clean audio to Google: {clean_wav_path}")
+        uploaded_file = client.files.upload(
+            file=clean_wav_path,
+            config={'mime_type': 'audio/wav'}
         )
-        # --- End Fix ---
         
-        # --- FIX: Wait for file to be ACTIVE ---
-        active_file_response = wait_for_file_active(audio_file_response)
-        # --- End Fix ---
+        # 4. Wait for file to be active
+        active_file = wait_for_file_active(uploaded_file)
 
-        # 2. Transcribe the entire conversation using Gemini
-        print("Transcribing audio via Gemini API...")
-        transcription_prompt = [
-            "Please transcribe the following audio file. Provide only the text transcription and nothing else.",
-            active_file_response # Use the active file
-        ]
-        transcription_response = gemini_model.generate_content(transcription_prompt)
+        # 5. Transcribe audio
+        print("Transcribing audio...")
+        transcription_response = client.models.generate_content(
+            model=MODEL_ID,
+            contents=[
+                "Please transcribe the following audio file. Provide only the text transcription and nothing else.",
+                active_file
+            ]
+        )
         transcribed_text = transcription_response.text
         print(f"Full Transcription: '{transcribed_text}'")
 
-        if not transcribed_text.strip():
+        if not transcribed_text or not transcribed_text.strip():
             return jsonify({'error': 'No speech detected.'})
 
-        # 3. Use a sophisticated prompt to extract all fields into a JSON object
-        print("Extracting structured data with Gemini...")
-        
+        # 6. Structured extraction
         schema_description = "\n".join([f'- "{key}": "{description}"' for key, description in VOICE_FILLABLE_SCHEMA.items()])
-
         prompt = f"""
-        You are an expert medical scribe specializing in dental forms. Your task is to analyze a conversation transcript and extract key information into a structured JSON object.
-
-        Analyze the transcript and fill in the values for the following JSON schema. ONLY fill the fields listed below. Do not attempt to answer Yes/No questions.
+        You are an expert medical scribe specializing in dental forms. 
+        Analyze the transcript and fill in the values for the following JSON schema. 
+        ONLY fill the fields listed below. Do not attempt to answer Yes/No questions.
 
         JSON Schema to fill:
         {schema_description}
 
         Extraction Rules:
-        - The JSON object must only contain the keys listed in the schema above.
-        - If information for a key is not in the transcript, the value must be an empty string "".
-        - Translate any non-English information (e.g., Hindi, Tamil) into English.
-        - Normalize data: write ages and numbers as digits. Format dates clearly.
-        - Your final output MUST be a single, valid JSON object and nothing else. Do not add explanations.
+        - JSON object must only contain keys listed in schema.
+        - If missing, value must be "".
+        - Translate non-English to English.
+        - Normalize data (digits for ages, clear date formats).
+        - Output MUST be a single, valid JSON object only.
 
-        Transcript:
-        ---
-        {transcribed_text}
-        ---
-
-        JSON Output:
+        Transcript: {transcribed_text}
         """
         
-        response = gemini_model.generate_content(prompt)
+        extraction_response = client.models.generate_content(
+            model=MODEL_ID,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type='application/json'
+            )
+        )
         
-        response_text = response.text.strip().replace('```json', '').replace('```', '')
-        print(f"Gemini Raw Response: {response_text}")
-
-        extracted_data = json.loads(response_text)
-        print(f"Successfully Parsed JSON: {extracted_data}")
-
+        extracted_data = json.loads(extraction_response.text)
         return jsonify({
             'transcribed_text': transcribed_text,
             'extracted_data': extracted_data
         })
 
-    except json.JSONDecodeError:
-        print("Error: Failed to decode JSON from Gemini's response.")
-        return jsonify({'error': "AI response was not valid JSON. Please check server logs."}), 500
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print("\n=== ERROR IN /process_audio ===")
+        traceback.print_exc()
+        print("===============================\n")
         return jsonify({'error': str(e)}), 500
     finally:
-        # CRITICAL: Always clean up the temporary file
+        # Safe cleanup process for ALL files
         if os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
-            print(f"Cleaned up temp file: {temp_audio_path}")
-        # CRITICAL: Always clean up the uploaded file from Google
-        try:
-            if audio_file_response:
-                genai.delete_file(audio_file_response.name)
-                print(f"Cleaned up uploaded file: {audio_file_response.name}")
-        except Exception as e:
-            print(f"Error cleaning up uploaded file (it may auto-delete): {e}")
+        if os.path.exists(clean_wav_path):
+            os.remove(clean_wav_path)
+            
+        # Verify uploaded_file actually exists and has a name before trying to delete
+        if uploaded_file and hasattr(uploaded_file, 'name'):
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception as e:
+                print(f"Warning: Failed to delete file from Google servers: {e}")
 
 @app.route('/transcribe', methods=['POST'])
 def transcribe_field():
     print("\n--- Request received for single field transcription ---")
-    if gemini_model is None:
-        return jsonify({'error': 'Gemini model failed to load. Check server logs.'}), 500
-
     if 'audio_data' not in request.files:
         return jsonify({'error': 'No audio file found'}), 400
 
     audio_file = request.files['audio_data']
-
-    # --- FIX: Use the browser's MIME type to determine extension ---
     mime_type = audio_file.mimetype
     extension = get_extension_from_mimetype(mime_type)
-    temp_audio_path = os.path.join(TEMP_DIR, f"temp_audio_{uuid.uuid4()}{extension}")
-    print(f"Detected MIME type: {mime_type}, saving to {temp_audio_path}")
-    # --- End Fix ---
     
-    audio_file_response = None # To hold the Google File API response
+    # Define paths for both the raw upload and the converted WAV
+    base_uuid = str(uuid.uuid4())
+    temp_audio_path = os.path.join(TEMP_DIR, f"temp_raw_{base_uuid}{extension}")
+    clean_wav_path = os.path.join(TEMP_DIR, f"clean_audio_{base_uuid}.wav")
+    
+    uploaded_file = None
     
     try:
+        # 1. Save raw file
         audio_file.save(temp_audio_path)
-        print(f"Audio saved to: {temp_audio_path}")
         
-        # 1. Upload audio to Google File API
-        print(f"Uploading audio to Google File API: {temp_audio_path}")
-        # --- FIX: Use the original mime_type from the request ---
-        audio_file_response = genai.upload_file(
-            path=temp_audio_path,
-            display_name=os.path.basename(temp_audio_path),
-            mime_type=mime_type
+        # 2. Convert to WAV
+        print(f"Converting {temp_audio_path} to clean WAV format...")
+        audio = AudioSegment.from_file(temp_audio_path)
+        audio.export(clean_wav_path, format="wav")
+
+        # 3. Upload clean WAV
+        print(f"Uploading clean audio to Google: {clean_wav_path}")
+        uploaded_file = client.files.upload(
+            file=clean_wav_path,
+            config={'mime_type': 'audio/wav'}
         )
-        # --- End Fix ---
         
-        # --- FIX: Wait for file to be ACTIVE ---
-        active_file_response = wait_for_file_active(audio_file_response)
-        # --- End Fix ---
+        active_file = wait_for_file_active(uploaded_file)
 
-        # 2. Transcribe audio using Gemini
-        print("Transcribing audio via Gemini API...")
-        transcription_prompt = [
-            "Please transcribe the following audio file. Provide only the text transcription and nothing else.",
-            active_file_response # Use the active file
-        ]
-        transcription_response = gemini_model.generate_content(transcription_prompt)
-        transcribed_text = transcription_response.text
-        print(f"Transcription result: '{transcribed_text}'")
-
-        if not transcribed_text.strip():
-            return jsonify({'text': ''})
-
-        return jsonify({'text': transcribed_text})
+        print("Transcribing audio...")
+        response = client.models.generate_content(
+            model=MODEL_ID,
+            contents=["Transcribe this audio. Only the text.", active_file]
+        )
+        
+        print(f"Transcription result: '{response.text}'")
+        return jsonify({'text': response.text})
 
     except Exception as e:
-        print(f"An error occurred during transcription: {e}")
+        print("\n=== ERROR IN /transcribe ===")
+        traceback.print_exc()
+        print("============================\n")
         return jsonify({'error': str(e)}), 500
     finally:
-        # CRITICAL: Always clean up the temporary file
+        # Safe cleanup process for ALL files
         if os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
-            print(f"Cleaned up temp file: {temp_audio_path}")
-        # CRITICAL: Always clean up the uploaded file from Google
-        try:
-            if audio_file_response:
-                genai.delete_file(audio_file_response.name)
-                print(f"Cleaned up uploaded file: {audio_file_response.name}")
-        except Exception as e:
-            print(f"Error cleaning up uploaded file (it may auto-delete): {e}")
+        if os.path.exists(clean_wav_path):
+            os.remove(clean_wav_path)
+            
+        if uploaded_file and hasattr(uploaded_file, 'name'):
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except Exception as e:
+                print(f"Warning: Failed to delete file from Google servers: {e}")
 
-# This block is for local development.
-# Render will use a WSGI server like Gunicorn and will not run this.
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
-
